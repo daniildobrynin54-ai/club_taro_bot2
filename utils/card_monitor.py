@@ -336,37 +336,54 @@ class CardMonitor:
 # ✅ ИСПРАВЛЕННАЯ ФУНКЦИЯ УВЕДОМЛЕНИЯ ПОЛЬЗОВАТЕЛЕЙ
 # ═════════════════════════════════════════════════════════════
 
-async def notify_card_owners(context, card_data: Dict):
-    """Уведомляет пользователей бота, у которых есть нужная карта"""
-    from database.db import get_all_users
-    
+# ═════════════════════════════════════════════════════════════
+# ЗАМЕНИТЕ ФУНКЦИЮ notify_card_owners В utils/card_monitor.py
+# НА ЭТУ ВЕРСИЮ (уважает настройки уведомлений per-аккаунт)
+# ═════════════════════════════════════════════════════════════
+
+async def notify_card_owners(context, card_data):
+    """
+    Уведомляет пользователей бота, у которых есть нужная карта,
+    с учётом их настроек уведомлений per-аккаунт.
+    """
+    import json
+    import logging
+    from database.db import get_all_users, NOTIF_KEY_MAIN
+    from config.settings import BASE_URL
+    from telegram.constants import ParseMode
+
+    logger = logging.getLogger(__name__)
+    BOOST_URL = f"{BASE_URL}/clubs/klub-taro-2/boost"
+
     club_owner_ids = {o['id'] for o in card_data.get('club_owners', [])}
-    
+
     if not club_owner_ids:
         logger.debug("📭 Нет владельцев карты в клубе — уведомления не требуются")
         return
-    
+
     logger.info(f"🔍 Проверяем {len(club_owner_ids)} владельцев карты среди пользователей бота")
-    
+
     bot_users = get_all_users()
     logger.debug(f"📊 Всего пользователей бота: {len(bot_users)}")
-    
+
     notified_count = 0
-    
+
     for user in bot_users:
         user_id = user['user_id']
         main_profile_id = user.get('profile_id')
         twinks_json = user.get('twinks')
-        
+        # ✅ Настройки уведомлений (уже десериализованы в get_all_users)
+        notif_settings = user.get('notification_settings', {})
+
         has_card = False
-        card_source = None
         account_nickname = None
+        notif_key = None  # Ключ для проверки настройки уведомлений
 
         # Проверяем основной аккаунт
         if main_profile_id and main_profile_id in club_owner_ids:
             has_card = True
-            account_nickname = user.get('site_nickname') or 'User ' + str(main_profile_id)
-            card_source = account_nickname
+            account_nickname = user.get('site_nickname') or f"User {main_profile_id}"
+            notif_key = NOTIF_KEY_MAIN
             logger.info(f"✅ Карта найдена у пользователя {user_id} (основной: {account_nickname})")
 
         # Проверяем твинов
@@ -376,53 +393,54 @@ async def notify_card_owners(context, card_data: Dict):
                 for twink in twinks:
                     if twink.get('profile_id') in club_owner_ids:
                         has_card = True
-                        account_nickname = twink.get('site_nickname') or 'User ' + str(twink.get('profile_id'))
-                        card_source = account_nickname
+                        account_nickname = twink.get('site_nickname') or f"User {twink.get('profile_id')}"
+                        notif_key = str(twink.get('profile_id'))
                         logger.info(f"✅ Карта найдена у пользователя {user_id} (твин: {account_nickname})")
                         break
             except Exception as e:
                 logger.error(f"❌ Ошибка парсинга твинов для пользователя {user_id}: {e}")
 
+        if not has_card:
+            continue
+
+        # ✅ Проверяем, включены ли уведомления для этого аккаунта
+        notif_enabled = notif_settings.get(notif_key, True) if notif_key else True
+        if not notif_enabled:
+            logger.info(f"🔕 Уведомления выключены для пользователя {user_id}, аккаунт '{notif_key}' — пропускаем")
+            continue
+
         # Отправляем личное уведомление
-        if has_card:
-            try:
-                caption = (
-                    f"🎴 <b>У вас есть нужная карта клуба!</b>\n\n"
-                    f"<b>{card_data['card_name']}</b>\n"
-                    f"ID: {card_data['card_id']} | Ранг: {card_data.get('card_rank', '?')}\n\n"
-                    f"📍 Аккаунт: <b>{account_nickname}</b>\n"
-                    f"🎯 Замен: {card_data['card_progress']}\n"
-                    f"📅 Вложено сегодня: {card_data['daily_donated']}\n\n"
-                    f"<a href='{BOOST_URL}'>🚀 Внести карту в клуб</a>"
-                )
-                
-                logger.debug(f"📤 Отправка личного уведомления пользователю {user_id}")
-                
-                if card_data.get('card_image_url'):
-                    await context.bot.send_photo(
-                        chat_id=user_id,
-                        photo=card_data['card_image_url'],
-                        caption=caption,
-                        parse_mode=ParseMode.HTML
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=caption,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True
-                    )
-                
-                notified_count += 1
-                logger.info(f"✅ Личное уведомление отправлено пользователю {user_id} ({card_source})")
-                
-            except Exception as e:
-                logger.error(f"❌ Ошибка отправки уведомления пользователю {user_id}: {e}", exc_info=True)
-    
+        try:
+            caption = (
+                f"🎴 <b>У вас есть нужная карта клуба!</b>\n\n"
+                f"<b>{card_data['card_name']}</b>\n"
+                f"ID: {card_data['card_id']} | Ранг: {card_data.get('card_rank', '?')}\n\n"
+                f"📍 Аккаунт: <b>{account_nickname}</b>\n"
+                f"🎯 Замен: {card_data['card_progress']}\n"
+                f"📅 Вложено сегодня: {card_data['daily_donated']}\n\n"
+                f"<a href='{BOOST_URL}'>🚀 Внести карту в клуб</a>\n\n"
+                f"<i>Управление уведомлениями: кнопка 🔔 Уведомления</i>"
+            )
+
+            if card_data.get('card_image_url'):
+                await context.bot.send_photo(
+                    chat_id=user_id, photo=card_data['card_image_url'],
+                    caption=caption, parse_mode=ParseMode.HTML)
+            else:
+                await context.bot.send_message(
+                    chat_id=user_id, text=caption,
+                    parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+            notified_count += 1
+            logger.info(f"✅ Уведомление отправлено пользователю {user_id} ({account_nickname})")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки уведомления пользователю {user_id}: {e}", exc_info=True)
+
     if notified_count > 0:
         logger.info(f"🎯 Отправлено {notified_count} личных уведомлений о карте {card_data['card_id']}")
     else:
-        logger.debug("📭 Пользователей бота с этой картой не найдено")
+        logger.debug("📭 Пользователей бота с этой картой (с включёнными уведомлениями) не найдено")
 
 
 # ═════════════════════════════════════════════════════════════

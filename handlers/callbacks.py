@@ -1,7 +1,8 @@
 """
 Обработчики нажатий на inline-кнопки
 ✅ ИСПРАВЛЕНО: Правильная проверка ролей (оператор vs администратор)
-✅ ИСПРАВЛЕНО: Нельзя привязать пустой твин — добавлена кнопка "Отмена" и проверка счётчика
+✅ ИСПРАВЛЕНО: Нельзя привязать пустой твин
+✅ ДОБАВЛЕНО: Переключение настроек уведомлений per-аккаунт
 """
 import logging
 from telegram import Update, LinkPreviewOptions
@@ -13,7 +14,8 @@ from database.db import (
     add_to_blacklist, remove_from_blacklist, get_blacklist,
     is_user_linked, get_user_profile_url, log_operator_action,
     get_twinks_count, remove_twink,
-    is_staff, is_admin
+    is_staff, is_admin,
+    toggle_notification, get_notification_settings,
 )
 from keyboards.inline import (
     get_main_menu_keyboard, get_back_button,
@@ -23,6 +25,7 @@ from keyboards.inline import (
     get_fan_question_keyboard, get_arcana_keyboard,
     get_q5_keyboard, get_app_review_keyboard,
     get_twink_question_keyboard, get_twink_done_keyboard, get_twink_manage_keyboard,
+    get_notifications_keyboard, notifications_text,
     app_q1_text, app_q2_text, app_q3_text, app_q3_arcana_text,
     app_q4_text, app_q5_text, app_review_text,
 )
@@ -33,97 +36,62 @@ logger = logging.getLogger(__name__)
 
 
 # ═════════════════════════════════════════════════════════════
-# БЕЗОПАСНЫЕ ОБЁРТКИ ДЛЯ РАБОТЫ С TELEGRAM API
+# БЕЗОПАСНЫЕ ОБЁРТКИ
 # ═════════════════════════════════════════════════════════════
 
 async def safe_answer_callback(query):
-    """Безопасный ответ на callback_query с обработкой ошибок"""
     try:
         await query.answer()
         return True
-    except TimedOut:
-        logger.warning(f"⏱️ Timeout при ответе на callback от пользователя {query.from_user.id}")
-        return False
-    except NetworkError as e:
-        logger.error(f"🌐 Сетевая ошибка при ответе на callback: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"❌ Неожиданная ошибка при ответе на callback: {e}")
+    except (TimedOut, NetworkError, Exception) as e:
+        logger.warning(f"Ошибка ответа на callback: {e}")
         return False
 
 
 async def safe_edit_message(query, text, **kwargs):
-    """Безопасное редактирование сообщения с обработкой ошибок"""
     try:
         await query.edit_message_text(text, **kwargs)
         return True
     except BadRequest as e:
-        error_msg = str(e).lower()
-        if "message is not modified" in error_msg:
-            logger.debug(f"📝 Сообщение не изменилось для пользователя {query.from_user.id} - пропускаем")
+        if "message is not modified" in str(e).lower():
             return False
-        elif "message to edit not found" in error_msg:
-            logger.warning(f"🔍 Сообщение для редактирования не найдено: пользователь {query.from_user.id}")
-            return False
-        elif "message can't be edited" in error_msg:
-            logger.warning(f"🚫 Сообщение нельзя редактировать: пользователь {query.from_user.id}")
-            return False
-        else:
-            logger.error(f"❌ BadRequest при редактировании сообщения: {e}")
-            return False
-    except TimedOut:
-        logger.warning(f"⏱️ Timeout при редактировании сообщения для пользователя {query.from_user.id}")
+        logger.error(f"BadRequest при редактировании: {e}")
         return False
-    except NetworkError as e:
-        logger.error(f"🌐 Сетевая ошибка при редактировании: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"❌ Неожиданная ошибка при редактировании сообщения: {e}")
+    except (TimedOut, NetworkError, Exception) as e:
+        logger.error(f"Ошибка редактирования сообщения: {e}")
         return False
 
 
 async def safe_edit_reply_markup(query, **kwargs):
-    """Безопасное редактирование reply_markup"""
     try:
         await query.edit_message_reply_markup(**kwargs)
         return True
     except BadRequest as e:
-        error_msg = str(e).lower()
-        if "message is not modified" in error_msg:
-            logger.debug(f"📝 Reply markup не изменилась - пропускаем")
+        if "message is not modified" in str(e).lower():
             return False
-        else:
-            logger.error(f"❌ BadRequest при редактировании reply_markup: {e}")
-            return False
-    except TimedOut:
-        logger.warning(f"⏱️ Timeout при редактировании reply_markup")
+        logger.error(f"BadRequest при редактировании markup: {e}")
         return False
     except Exception as e:
-        logger.error(f"❌ Ошибка при редактировании reply_markup: {e}")
+        logger.error(f"Ошибка редактирования markup: {e}")
         return False
 
 
 def _store_msg(context, message):
-    context.user_data['app_msg_id']   = message.message_id
-    context.user_data['app_chat_id']  = message.chat_id
+    context.user_data['app_msg_id']  = message.message_id
+    context.user_data['app_chat_id'] = message.chat_id
 
 
 # ═════════════════════════════════════════════════════════════
 # ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: завершение привязки аккаунта
 # ═════════════════════════════════════════════════════════════
 
-async def _finish_account_linking(query, context, user, user_id, twinks_count: int):
-    """
-    Общая функция завершения процесса привязки аккаунта.
-    Вызывается из twink_no, twink_done (linking) и cancel_twink_add (linking).
-    """
+async def _finish_account_linking(query, context, user, user_id: int, twinks_count: int):
     context.user_data['state'] = None
     context.user_data['twink_source'] = None
     context.user_data['twinks_added_this_session'] = 0
 
     is_operator = is_staff(user_id)
     main_profile_url = context.user_data.get('main_profile_url', 'не указан')
-
     twinks_info = f"\n💎 Привязано твинов: {twinks_count}" if twinks_count > 0 else ""
 
     try:
@@ -137,15 +105,13 @@ async def _finish_account_linking(query, context, user, user_id, twinks_count: i
             f"✅ <b>Аккаунт успешно привязан!</b>\n\n"
             f"Профиль: {main_profile_url}{twinks_info}\n\n"
             f"Теперь вам доступны все функции бота.\n"
-            f"Нажмите на иконку с квадратами рядом с полем ввода, "
-            f"чтобы открыть меню команд 👇"
+            f"Нажмите на иконку с квадратами рядом с полем ввода, чтобы открыть меню команд 👇"
         ),
         reply_markup=get_reply_keyboard_for_linked_user(is_operator=is_operator),
         parse_mode=ParseMode.HTML,
         link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
 
-    # Уведомляем оператора
     user_link = get_user_link(user_id, user.first_name or user.username or "Пользователь")
     try:
         await context.bot.send_message(
@@ -154,8 +120,7 @@ async def _finish_account_linking(query, context, user, user_id, twinks_count: i
                 f"🔗 <b>Новая привязка аккаунта</b>\n\n"
                 f"Пользователь: {user_link}\n"
                 f"ID: <code>{user_id}</code>\n"
-                f"Профиль: {main_profile_url}"
-                f"{twinks_info}"
+                f"Профиль: {main_profile_url}{twinks_info}"
                 + (f"\n\n⚙️ <i>Это персонал</i>" if is_operator else "")
             ),
             parse_mode=ParseMode.HTML,
@@ -170,7 +135,6 @@ async def _finish_account_linking(query, context, user, user_id, twinks_count: i
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатий на inline-кнопки"""
     query = update.callback_query
-    
     await safe_answer_callback(query)
 
     user    = query.from_user
@@ -178,236 +142,135 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = query.data
 
     # ══════════════════════════════════════════
-    # ✅ ОБРАБОТКА КНОПОК УПРАВЛЕНИЯ ТВИНАМИ
+    # ✅ НАСТРОЙКИ УВЕДОМЛЕНИЙ
     # ══════════════════════════════════════════
+
+    if data == 'notif_noop':
+        # Кнопка с названием аккаунта — не делаем ничего
+        return
+
+    if data.startswith('toggle_notif_'):
+        profile_key = data[len('toggle_notif_'):]
+        new_value = toggle_notification(user_id, profile_key)
+
+        status_word = "включены ✅" if new_value else "выключены 🔕"
+        await query.answer(f"Уведомления {status_word}", show_alert=False)
+
+        # Обновляем текст и клавиатуру на месте
+        await safe_edit_message(
+            query,
+            notifications_text(user_id),
+            reply_markup=get_notifications_keyboard(user_id),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    # ══════════════════════════════════════════
+    # УПРАВЛЕНИЕ ТВИНАМИ
+    # ══════════════════════════════════════════
+
     if data == 'add_twink':
-        """Пользователь хочет добавить твин через меню твинов"""
         context.user_data['state'] = 'adding_twinks'
-        # ✅ Запоминаем источник и сбрасываем счётчик добавленных за сессию
         context.user_data['twink_source'] = 'menu'
         context.user_data['twinks_added_this_session'] = 0
-        
         await safe_edit_message(
             query,
             "💎 <b>Добавление твина</b>\n\n"
             "Отправьте ссылку на ваш дополнительный аккаунт на MangaBuff.\n\n"
             "Формат: <code>https://mangabuff.ru/users/XXXXXX</code>\n\n"
             "❗️ Твины могут не состоять в клубе.\n\n"
-            "Когда закончите добавлять, нажмите кнопку «Готово».\n"
-            "Для отмены нажмите «Отмена».",
+            "Когда закончите добавлять, нажмите «Готово».\nДля отмены нажмите «Отмена».",
             reply_markup=get_twink_done_keyboard(),
             parse_mode=ParseMode.HTML
         )
-        logger.info(f"Пользователь {user_id} начал добавление твина через меню")
         return
 
     if data.startswith('delete_twink_'):
-        """Удаление твина"""
         profile_id = data.replace('delete_twink_', '')
-        
         success = remove_twink(user_id, profile_id)
-        
         if success:
-            twinks_count = get_twinks_count(user_id)
-            
             await query.answer("✅ Твин удалён", show_alert=False)
-            
             from database.db import get_user_twinks
             twinks = get_user_twinks(user_id)
-            
             if not twinks:
-                text_msg = (
-                    "💎 <b>Дополнительные аккаунты (твины)</b>\n\n"
-                    "У вас больше нет привязанных твинов.\n\n"
-                    "Хотите добавить твин?"
-                )
+                text_msg = "💎 <b>Дополнительные аккаунты (твины)</b>\n\nУ вас больше нет привязанных твинов.\n\nХотите добавить твин?"
             else:
-                twinks_list = "\n".join(
-                    f"{idx+1}. {t.get('site_nickname', 'Без ника')} - {t.get('profile_url')}"
-                    for idx, t in enumerate(twinks)
-                )
-                text_msg = (
-                    f"💎 <b>Ваши твины ({len(twinks)})</b>\n\n"
-                    f"{twinks_list}\n\n"
-                    "Вы можете добавить новый или удалить существующий."
-                )
-            
-            await safe_edit_message(
-                query,
-                text_msg,
-                reply_markup=get_twink_manage_keyboard(user_id),
-                parse_mode=ParseMode.HTML,
-                link_preview_options=LinkPreviewOptions(is_disabled=True)
-            )
-            
-            logger.info(f"Пользователь {user_id} удалил твин {profile_id}")
+                twinks_list = "\n".join(f"{i+1}. {t.get('site_nickname','Без ника')} - {t.get('profile_url')}" for i, t in enumerate(twinks))
+                text_msg = f"💎 <b>Ваши твины ({len(twinks)})</b>\n\n{twinks_list}\n\nВы можете добавить новый или удалить существующий."
+            await safe_edit_message(query, text_msg, reply_markup=get_twink_manage_keyboard(user_id),
+                                    parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
         else:
             await query.answer("❌ Ошибка удаления", show_alert=True)
-        
         return
 
     if data == 'twink_yes':
-        """Пользователь хочет привязать твины (из потока привязки аккаунта)"""
         context.user_data['state'] = 'adding_twinks'
-        # ✅ Запоминаем источник и сбрасываем счётчик
         context.user_data['twink_source'] = 'linking'
         context.user_data['twinks_added_this_session'] = 0
-        
         await safe_edit_message(
             query,
             "💎 <b>Привязка дополнительных аккаунтов (твинов)</b>\n\n"
             "Отправьте ссылку на ваш дополнительный аккаунт на MangaBuff.\n\n"
             "Формат: <code>https://mangabuff.ru/users/XXXXXX</code>\n\n"
             "❗️ Твины могут не состоять в клубе.\n\n"
-            "Когда закончите добавлять, нажмите кнопку «Готово».\n"
-            "Для отмены нажмите «Отмена».",
+            "Когда закончите добавлять, нажмите «Готово».\nДля отмены нажмите «Отмена».",
             reply_markup=get_twink_done_keyboard(),
             parse_mode=ParseMode.HTML
         )
-        logger.info(f"Пользователь {user_id} начал привязку твинов")
         return
 
-    # ══════════════════════════════════════════
-    # ✅ НОВЫЙ ОБРАБОТЧИК: ОТМЕНА ДОБАВЛЕНИЯ ТВИНА
-    # ══════════════════════════════════════════
     if data == 'cancel_twink_add':
-        """
-        Пользователь нажал «Отмена» при добавлении твина.
-        Поведение зависит от источника:
-          - 'linking': аккаунт уже привязан — завершаем поток как twink_no
-          - 'menu': возвращаем к управлению твинами
-        """
         context.user_data['state'] = None
         source = context.user_data.get('twink_source', 'menu')
         added_count = context.user_data.get('twinks_added_this_session', 0)
 
         if source == 'linking':
-            # Аккаунт уже был привязан — просто завершаем без твинов
-            # (или с уже добавленными, если успели добавить до отмены)
             twinks_count = get_twinks_count(user_id)
             await _finish_account_linking(query, context, user, user_id, twinks_count)
         else:
-            # Пришли из меню — возвращаем к экрану управления твинами
             context.user_data['twink_source'] = None
             context.user_data['twinks_added_this_session'] = 0
-
             from database.db import get_user_twinks
             twinks = get_user_twinks(user_id)
-
             if not twinks:
-                text_msg = (
-                    "💎 <b>Дополнительные аккаунты (твины)</b>\n\n"
-                    "У вас пока нет привязанных твинов.\n\n"
-                    "Хотите добавить твин?"
-                )
+                text_msg = "💎 <b>Дополнительные аккаунты (твины)</b>\n\nУ вас пока нет привязанных твинов.\n\nХотите добавить твин?"
             else:
-                twinks_list = "\n".join(
-                    f"{idx+1}. {t.get('site_nickname', 'Без ника')} - {t.get('profile_url')}"
-                    for idx, t in enumerate(twinks)
-                )
-                text_msg = (
-                    f"💎 <b>Ваши твины ({len(twinks)})</b>\n\n"
-                    f"{twinks_list}\n\n"
-                    "Вы можете добавить новый или удалить существующий."
-                )
-
-            await safe_edit_message(
-                query,
-                text_msg,
-                reply_markup=get_twink_manage_keyboard(user_id),
-                parse_mode=ParseMode.HTML,
-                link_preview_options=LinkPreviewOptions(is_disabled=True)
-            )
-
-        logger.info(
-            f"Пользователь {user_id} отменил добавление твина "
-            f"(источник: {source}, добавлено за сессию: {added_count})"
-        )
+                twinks_list = "\n".join(f"{i+1}. {t.get('site_nickname','Без ника')} - {t.get('profile_url')}" for i, t in enumerate(twinks))
+                text_msg = f"💎 <b>Ваши твины ({len(twinks)})</b>\n\n{twinks_list}\n\nВы можете добавить новый или удалить существующий."
+            await safe_edit_message(query, text_msg, reply_markup=get_twink_manage_keyboard(user_id),
+                                    parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        logger.info(f"Пользователь {user_id} отменил добавление твина (источник: {source}, добавлено: {added_count})")
         return
 
     if data == 'twink_no':
-        """Пользователь отказался от привязки твинов"""
         twinks_count = get_twinks_count(user_id)
         await _finish_account_linking(query, context, user, user_id, twinks_count)
         return
 
     if data == 'twink_done':
-        """
-        Пользователь нажал «Готово» при добавлении твинов.
-        ✅ ИСПРАВЛЕНО: Если ни одного твина не было добавлено за сессию —
-        показываем предупреждение и остаёмся в режиме добавления.
-        Исключение: источник 'linking' — завершаем поток в любом случае.
-        """
         context.user_data['state'] = None
         source = context.user_data.get('twink_source', 'menu')
         added_count = context.user_data.get('twinks_added_this_session', 0)
 
         if source == 'linking':
-            # Из потока привязки аккаунта — завершаем в любом случае
             twinks_count = get_twinks_count(user_id)
             await _finish_account_linking(query, context, user, user_id, twinks_count)
-
         else:
-            # Из меню
-            if added_count == 0:
-                # ✅ Ничего не было добавлено — возвращаем к управлению твинами
-                from database.db import get_user_twinks
-                twinks = get_user_twinks(user_id)
-
-                if not twinks:
-                    text_msg = (
-                        "💎 <b>Дополнительные аккаунты (твины)</b>\n\n"
-                        "Вы не добавили ни одного твина.\n\n"
-                        "Хотите попробовать ещё раз?"
-                    )
-                else:
-                    twinks_list = "\n".join(
-                        f"{idx+1}. {t.get('site_nickname', 'Без ника')} - {t.get('profile_url')}"
-                        for idx, t in enumerate(twinks)
-                    )
-                    text_msg = (
-                        f"💎 <b>Ваши твины ({len(twinks)})</b>\n\n"
-                        f"{twinks_list}\n\n"
-                        "Вы можете добавить новый или удалить существующий."
-                    )
-
-                await safe_edit_message(
-                    query,
-                    text_msg,
-                    reply_markup=get_twink_manage_keyboard(user_id),
-                    parse_mode=ParseMode.HTML,
-                    link_preview_options=LinkPreviewOptions(is_disabled=True)
-                )
-
-                logger.info(f"Пользователь {user_id} нажал 'Готово' без добавления твинов (меню)")
-
-            else:
-                # Твины были добавлены — показываем итог
-                from database.db import get_user_twinks
-                twinks = get_user_twinks(user_id)
-                twinks_list = "\n".join(
-                    f"{idx+1}. {t.get('site_nickname', 'Без ника')} - {t.get('profile_url')}"
-                    for idx, t in enumerate(twinks)
-                )
-                await safe_edit_message(
-                    query,
-                    f"✅ <b>Твины успешно добавлены!</b>\n\n"
-                    f"💎 <b>Ваши твины ({len(twinks)})</b>\n\n"
-                    f"{twinks_list}\n\n"
-                    "Управляйте твинами через кнопки ниже.",
-                    reply_markup=get_twink_manage_keyboard(user_id),
-                    parse_mode=ParseMode.HTML,
-                    link_preview_options=LinkPreviewOptions(is_disabled=True)
-                )
-
-                logger.info(
-                    f"Пользователь {user_id} завершил добавление твинов "
-                    f"(добавлено: {added_count})"
-                )
-
             context.user_data['twink_source'] = None
             context.user_data['twinks_added_this_session'] = 0
-
+            from database.db import get_user_twinks
+            twinks = get_user_twinks(user_id)
+            if added_count == 0:
+                if not twinks:
+                    text_msg = "💎 <b>Дополнительные аккаунты (твины)</b>\n\nВы не добавили ни одного твина.\n\nХотите попробовать ещё раз?"
+                else:
+                    twinks_list = "\n".join(f"{i+1}. {t.get('site_nickname','Без ника')} - {t.get('profile_url')}" for i, t in enumerate(twinks))
+                    text_msg = f"💎 <b>Ваши твины ({len(twinks)})</b>\n\n{twinks_list}\n\nВы можете добавить новый или удалить существующий."
+            else:
+                twinks_list = "\n".join(f"{i+1}. {t.get('site_nickname','Без ника')} - {t.get('profile_url')}" for i, t in enumerate(twinks))
+                text_msg = f"✅ <b>Твины успешно добавлены!</b>\n\n💎 <b>Ваши твины ({len(twinks)})</b>\n\n{twinks_list}\n\nУправляйте твинами через кнопки ниже."
+            await safe_edit_message(query, text_msg, reply_markup=get_twink_manage_keyboard(user_id),
+                                    parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
         return
 
     # ══════════════════════════════════════════
@@ -421,13 +284,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['twinks_added_this_session'] = 0
         linked = is_user_linked(user_id)
         is_operator = is_staff(user_id)
-        
         if linked:
             try:
                 await query.message.delete()
             except Exception:
                 pass
-            
             await context.bot.send_message(
                 chat_id=user_id,
                 text=WELCOME_TEXT + "\n\n✅ Используйте кнопки внизу.",
@@ -435,12 +296,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML
             )
         else:
-            await safe_edit_message(
-                query,
-                WELCOME_TEXT,
-                reply_markup=get_main_menu_keyboard(),
-                parse_mode=ParseMode.HTML
-            )
+            await safe_edit_message(query, WELCOME_TEXT, reply_markup=get_main_menu_keyboard(), parse_mode=ParseMode.HTML)
         return
 
     if data == 'close_menu':
@@ -455,24 +311,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.delete()
         except Exception:
             pass
-        
         from handlers.commands import dialogs_command_impl
         await dialogs_command_impl(context.bot_data, context.bot, user_id, query.message.chat_id)
         return
 
     # ══════════════════════════════════════════
-    # ПРОФИЛЬ / УВЕДОМЛЕНИЯ / ХОТЕЛКИ / … 
+    # ПРОФИЛЬ / ХОТЕЛКИ / …
     # ══════════════════════════════════════════
     if data == 'profile':
         profile_url = get_user_profile_url(user_id)
         await safe_edit_message(
             query,
-            f"👤 <b>Ваш профиль</b>\n\n"
-            f"Имя: {user.first_name}\n"
+            f"👤 <b>Ваш профиль</b>\n\nИмя: {user.first_name}\n"
             f"Username: @{user.username if user.username else 'не указан'}\n"
             f"Профиль на сайте: {profile_url if profile_url else 'не привязан'}",
-            reply_markup=get_back_button(),
-            parse_mode=ParseMode.HTML,
+            reply_markup=get_back_button(), parse_mode=ParseMode.HTML,
             link_preview_options=LinkPreviewOptions(is_disabled=True)
         )
         return
@@ -480,47 +333,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == 'notifications':
         await safe_edit_message(
             query,
-            "🔔 <b>Уведомления</b>\n\nФункция в разработке.",
-            reply_markup=get_back_button(), 
+            notifications_text(user_id),
+            reply_markup=get_notifications_keyboard(user_id),
             parse_mode=ParseMode.HTML
         )
         return
 
     if data == 'wishlist':
-        await safe_edit_message(
-            query,
-            "💝 <b>Хотелки</b>\n\nФункция в разработке.",
-            reply_markup=get_back_button(), 
-            parse_mode=ParseMode.HTML
-        )
+        await safe_edit_message(query, "💝 <b>Хотелки</b>\n\nФункция в разработке.", reply_markup=get_back_button(), parse_mode=ParseMode.HTML)
         return
 
     if data == 'contract_ok':
-        await safe_edit_message(
-            query,
-            "📋 <b>Договор за ОК</b>\n\nФункция в разработке.",
-            reply_markup=get_back_button(), 
-            parse_mode=ParseMode.HTML
-        )
+        await safe_edit_message(query, "📋 <b>Договор за ОК</b>\n\nФункция в разработке.", reply_markup=get_back_button(), parse_mode=ParseMode.HTML)
         return
 
     if data == 'card_price':
-        await safe_edit_message(
-            query,
-            "💳 <b>Узнать цену Карты</b>\n\nФункция в разработке.",
-            reply_markup=get_back_button(), 
-            parse_mode=ParseMode.HTML
-        )
+        await safe_edit_message(query, "💳 <b>Узнать цену Карты</b>\n\nФункция в разработке.", reply_markup=get_back_button(), parse_mode=ParseMode.HTML)
         return
 
     if data == 'link_account':
         await safe_edit_message(
             query,
-            "🔗 <b>Привязка аккаунта</b>\n\n"
-            "Отправьте ссылку на ваш профиль на сайте mangabuff.ru\n\n"
+            "🔗 <b>Привязка аккаунта</b>\n\nОтправьте ссылку на ваш профиль на сайте mangabuff.ru\n\n"
             "Формат: <code>https://mangabuff.ru/users/XXXXXX</code>\n",
-            reply_markup=get_back_button(),
-            parse_mode=ParseMode.HTML
+            reply_markup=get_back_button(), parse_mode=ParseMode.HTML
         )
         context.user_data['state'] = 'linking_account'
         return
@@ -528,10 +364,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == 'contact_operator':
         await safe_edit_message(
             query,
-            "💬 <b>Связь с оператором</b>\n\n"
-            "Напишите ваш вопрос, и оператор ответит в течение 5-15 минут.",
-            reply_markup=get_back_button(),
-            parse_mode=ParseMode.HTML
+            "💬 <b>Связь с оператором</b>\n\nНапишите ваш вопрос, и оператор ответит в течение 5-15 минут.",
+            reply_markup=get_back_button(), parse_mode=ParseMode.HTML
         )
         context.user_data['state'] = 'contacting_operator'
         return
@@ -543,173 +377,96 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state']       = 'app_q1'
         context.user_data['app_answers'] = {}
         _store_msg(context, query.message)
-        await safe_edit_message(
-            query,
-            app_q1_text(),
-            reply_markup=get_app_q1_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
+        await safe_edit_message(query, app_q1_text(), reply_markup=get_app_q1_keyboard(), parse_mode=ParseMode.HTML)
         return
 
     if data.startswith('app_back_'):
         if data == 'app_back_3_arcana':
             context.user_data['state'] = 'app_q3_arcana'
-            await safe_edit_message(
-                query,
-                app_q3_arcana_text(),
-                reply_markup=get_arcana_keyboard(),
-                parse_mode=ParseMode.HTML
-            )
+            await safe_edit_message(query, app_q3_arcana_text(), reply_markup=get_arcana_keyboard(), parse_mode=ParseMode.HTML)
             return
-
         back_to = int(data.split('_')[-1])
-
         if back_to == 1:
             context.user_data['state'] = 'app_q1'
-            await safe_edit_message(
-                query,
-                app_q1_text(),
-                reply_markup=get_app_q1_keyboard(),
-                parse_mode=ParseMode.HTML
-            )
+            await safe_edit_message(query, app_q1_text(), reply_markup=get_app_q1_keyboard(), parse_mode=ParseMode.HTML)
         elif back_to == 2:
             context.user_data['state'] = 'app_q2'
-            await safe_edit_message(
-                query,
-                app_q2_text(),
-                reply_markup=get_app_back_keyboard(1),
-                parse_mode=ParseMode.HTML
-            )
+            await safe_edit_message(query, app_q2_text(), reply_markup=get_app_back_keyboard(1), parse_mode=ParseMode.HTML)
         elif back_to == 3:
             context.user_data['state'] = 'app_q3'
-            await safe_edit_message(
-                query,
-                app_q3_text(),
-                reply_markup=get_fan_question_keyboard(),
-                parse_mode=ParseMode.HTML
-            )
+            await safe_edit_message(query, app_q3_text(), reply_markup=get_fan_question_keyboard(), parse_mode=ParseMode.HTML)
         elif back_to == 4:
             q3_was_yes = context.user_data.get('app_answers', {}).get('q3') == 'Да'
             context.user_data['state'] = 'app_q4'
-            await safe_edit_message(
-                query,
-                app_q4_text(),
-                reply_markup=get_app_back_keyboard('3_arcana' if q3_was_yes else 3),
-                parse_mode=ParseMode.HTML
-            )
+            await safe_edit_message(query, app_q4_text(), reply_markup=get_app_back_keyboard('3_arcana' if q3_was_yes else 3), parse_mode=ParseMode.HTML)
         return
 
     if data == 'app_fan_yes':
         context.user_data['app_answers']['q3'] = 'Да'
         context.user_data['state'] = 'app_q3_arcana'
-        await safe_edit_message(
-            query,
-            app_q3_arcana_text(),
-            reply_markup=get_arcana_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
+        await safe_edit_message(query, app_q3_arcana_text(), reply_markup=get_arcana_keyboard(), parse_mode=ParseMode.HTML)
         return
 
     if data == 'app_fan_no':
-        context.user_data['app_answers']['q3']       = 'Нет'
+        context.user_data['app_answers']['q3'] = 'Нет'
         context.user_data['app_answers']['q3_arcana'] = None
         context.user_data['state'] = 'app_q4'
-        await safe_edit_message(
-            query,
-            app_q4_text(),
-            reply_markup=get_app_back_keyboard(3),
-            parse_mode=ParseMode.HTML
-        )
+        await safe_edit_message(query, app_q4_text(), reply_markup=get_app_back_keyboard(3), parse_mode=ParseMode.HTML)
         return
 
     if data.startswith('app_arcana_'):
-        chosen = data[len('app_arcana_'):]
-        context.user_data['app_answers']['q3_arcana'] = chosen
+        context.user_data['app_answers']['q3_arcana'] = data[len('app_arcana_'):]
         context.user_data['state'] = 'app_q4'
-        await safe_edit_message(
-            query,
-            app_q4_text(),
-            reply_markup=get_app_back_keyboard('3_arcana'),
-            parse_mode=ParseMode.HTML
-        )
+        await safe_edit_message(query, app_q4_text(), reply_markup=get_app_back_keyboard('3_arcana'), parse_mode=ParseMode.HTML)
         return
 
     if data == 'app_skip_5':
         context.user_data['app_answers']['q5'] = None
         context.user_data['state'] = 'app_review'
         answers = context.user_data.get('app_answers', {})
-        await safe_edit_message(
-            query,
-            app_review_text(answers),
-            reply_markup=get_app_review_keyboard(),
-            parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True)
-        )
+        await safe_edit_message(query, app_review_text(answers), reply_markup=get_app_review_keyboard(),
+                                parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
         return
 
     if data.startswith('app_edit_'):
         step = int(data.split('_')[-1])
         state_map = {1: 'app_q1', 2: 'app_q2', 3: 'app_q3', 4: 'app_q4', 5: 'app_q5'}
         text_map  = {
-            1: (app_q1_text,        get_app_q1_keyboard),
-            2: (app_q2_text,        lambda: get_app_back_keyboard(1)),
-            3: (app_q3_text,        get_fan_question_keyboard),
-            4: (app_q4_text,        lambda: get_app_back_keyboard(3)),
-            5: (app_q5_text,        get_q5_keyboard),
+            1: (app_q1_text, get_app_q1_keyboard),
+            2: (app_q2_text, lambda: get_app_back_keyboard(1)),
+            3: (app_q3_text, get_fan_question_keyboard),
+            4: (app_q4_text, lambda: get_app_back_keyboard(3)),
+            5: (app_q5_text, get_q5_keyboard),
         }
         context.user_data['state'] = state_map[step]
         txt_fn, kb_fn = text_map[step]
-        await safe_edit_message(
-            query,
-            txt_fn(),
-            reply_markup=kb_fn(),
-            parse_mode=ParseMode.HTML
-        )
+        await safe_edit_message(query, txt_fn(), reply_markup=kb_fn(), parse_mode=ParseMode.HTML)
         return
 
     if data == 'app_send':
         answers = context.user_data.get('app_answers', {})
         user_link = get_user_link(user_id, user.first_name or user.username or f"User {user_id}")
-
         q3_display = answers.get('q3', '—')
         if q3_display == 'Да':
-            arcana = answers.get('q3_arcana', '—')
-            q3_display = f"Да  ➜  аркана: {arcana}"
-
+            q3_display = f"Да  ➜  аркана: {answers.get('q3_arcana', '—')}"
         admin_text = (
-            f"📝 <b>Новая заявка на вступление</b>\n"
-            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-            f"От: {user_link}\n"
-            f"ID: <code>{user_id}</code>\n"
-            f"Username: @{user.username or '—'}\n\n"
-            f"<b>1. Почему наш клуб?</b>\n{answers.get('q1', '—')}\n\n"
-            f"<b>2. MangaBuff:</b>\n{answers.get('q2', '—')}\n\n"
+            f"📝 <b>Новая заявка на вступление</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"От: {user_link}\nID: <code>{user_id}</code>\nUsername: @{user.username or '—'}\n\n"
+            f"<b>1. Почему наш клуб?</b>\n{answers.get('q1','—')}\n\n"
+            f"<b>2. MangaBuff:</b>\n{answers.get('q2','—')}\n\n"
             f"<b>3. Фанат Повелителя тайн:</b> {q3_display}\n\n"
-            f"<b>4. Обращение:</b> {answers.get('q4', '—')}\n\n"
+            f"<b>4. Обращение:</b> {answers.get('q4','—')}\n\n"
             f"<b>5. Доп. сообщение:</b>\n{answers.get('q5') or '—'}"
         )
-
         try:
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=admin_text,
-                reply_markup=get_user_action_keyboard(user_id),
-                parse_mode=ParseMode.HTML,
-                link_preview_options=LinkPreviewOptions(is_disabled=True)
-            )
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_text,
+                                           reply_markup=get_user_action_keyboard(user_id),
+                                           parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
         except Exception as e:
-            logger.error(f"Ошибка отправки заявки оператору: {e}")
-
+            logger.error(f"Ошибка отправки заявки: {e}")
         context.user_data['state'] = None
         context.user_data['app_answers'] = {}
-
-        await safe_edit_message(
-            query,
-            "✅ <b>Заявка отправлена!</b>\n\n"
-            "Спасибо за интерес к Club Taro. "
-            "Оператор рассмотрит заявку и свяжется с вами.",
-            parse_mode=ParseMode.HTML
-        )
+        await safe_edit_message(query, "✅ <b>Заявка отправлена!</b>\n\nСпасибо за интерес к Club Taro. Оператор рассмотрит заявку и свяжется с вами.", parse_mode=ParseMode.HTML)
         return
 
     # ══════════════════════════════════════════
@@ -720,227 +477,114 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_staff(user_id):
             await query.answer("❌ Недостаточно прав", show_alert=True)
             return
-            
         blacklist = get_blacklist()
         if not blacklist:
-            await safe_edit_message(
-                query,
-                "📋 <b>Черный список</b>\n\nЧерный список пуст.",
-                reply_markup=get_back_button(), 
-                parse_mode=ParseMode.HTML
-            )
+            await safe_edit_message(query, "📋 <b>Черный список</b>\n\nЧерный список пуст.", reply_markup=get_back_button(), parse_mode=ParseMode.HTML)
             return
-
         text = "📋 <b>Черный список</b>\n\n"
         for bl_uid, username, first_name, reason, blocked_at in blacklist:
             ul = get_user_link(bl_uid, first_name or username or f"User {bl_uid}")
-            text += (
-                f"👤 {ul}\n"
-                f"ID: <code>{bl_uid}</code>\n"
-                + (f"Username: @{username}\n" if username else "")
-                + (f"Причина: {reason}\n"     if reason   else "")
-                + f"Заблокирован: {blocked_at}\n"
-                + f"Разблокировать: /unblock {bl_uid}\n"
-                + "─" * 30 + "\n\n"
-            )
-        await safe_edit_message(
-            query,
-            text, 
-            reply_markup=get_back_button(), 
-            parse_mode=ParseMode.HTML
-        )
+            text += (f"👤 {ul}\nID: <code>{bl_uid}</code>\n"
+                     + (f"Username: @{username}\n" if username else "")
+                     + (f"Причина: {reason}\n" if reason else "")
+                     + f"Заблокирован: {blocked_at}\nРазблокировать: /unblock {bl_uid}\n" + "─"*30 + "\n\n")
+        await safe_edit_message(query, text, reply_markup=get_back_button(), parse_mode=ParseMode.HTML)
         return
 
     if data.startswith('reply_'):
         if not is_staff(user_id):
             await query.answer("❌ Недостаточно прав", show_alert=True)
             return
-            
         reply_user_id = int(data.split('_')[1])
-        
         dm = DialogManager(context.bot_data)
-        
         try:
             user_info = await context.bot.get_chat(reply_user_id)
             user_name = user_info.first_name or user_info.username or f"User {reply_user_id}"
         except Exception:
             user_name = f"User {reply_user_id}"
-        
-        log_operator_action(
-            user_id,
-            'dialog_start',
-            target_user_id=reply_user_id,
-            target_username=user_info.username if 'user_info' in locals() else None,
-            target_first_name=user_name
-        )
-        
-        dialog_id = dm.start_dialog(user_id, reply_user_id, user_name)
-        
+        log_operator_action(user_id, 'dialog_start', target_user_id=reply_user_id, target_first_name=user_name)
+        dm.start_dialog(user_id, reply_user_id, user_name)
         try:
             await query.message.reply_text(
-                f"💬 <b>Диалог начат с пользователем {user_name} (ID: {reply_user_id})</b>\n\n"
-                f"Теперь все ваши сообщения будут отправляться этому пользователю.\n"
-                f"Все его сообщения будут приходить вам.\n\n"
-                f"💡 Команды:\n"
-                f"• /dialogs - список всех диалогов\n"
-                f"• /end_dialog - завершить текущий диалог\n"
-                f"• /end_all - завершить все диалоги",
-                parse_mode=ParseMode.HTML
-            )
-            
-            await context.bot.send_message(
-                chat_id=reply_user_id,
-                text=(
-                    "💬 <b>Оператор начал с вами диалог!</b>\n\n"
-                    "Теперь вы можете вести переписку напрямую.\n"
-                    "Просто напишите ваше сообщение.\n\n"
-                    "💡 Для завершения диалога используйте команду /end_dialog"
-                ),
-                parse_mode=ParseMode.HTML
-            )
+                f"💬 <b>Диалог начат с {user_name} (ID: {reply_user_id})</b>\n\n"
+                f"• /dialogs - список диалогов\n• /end_dialog - завершить\n• /end_all - завершить все",
+                parse_mode=ParseMode.HTML)
+            await context.bot.send_message(chat_id=reply_user_id,
+                text="💬 <b>Оператор начал с вами диалог!</b>\n\nПросто напишите ваше сообщение.\n\n💡 /end_dialog — завершить диалог",
+                parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.error(f"Ошибка при начале диалога: {e}")
         return
 
-    # ══════════════════════════════════════════
-    # БЛОКИРОВКА С УКАЗАНИЕМ ПРИЧИНЫ
-    # ══════════════════════════════════════════
     if data.startswith('block_'):
         if not is_staff(user_id):
             await query.answer("❌ Недостаточно прав", show_alert=True)
             return
-            
         blocked_uid = int(data.split('_')[1])
-        
         context.user_data['blocking_user_id'] = blocked_uid
         context.user_data['state'] = 'blocking_user'
-        
         await query.message.reply_text(
-            "🚫 <b>Блокировка пользователя</b>\n\n"
-            f"Пользователь ID: <code>{blocked_uid}</code>\n\n"
-            "Напишите причину блокировки или используйте /cancel для отмены:",
-            reply_markup=get_block_confirmation_keyboard(blocked_uid),
-            parse_mode=ParseMode.HTML
-        )
+            f"🚫 <b>Блокировка пользователя</b>\n\nID: <code>{blocked_uid}</code>\n\nНапишите причину блокировки или /cancel для отмены:",
+            reply_markup=get_block_confirmation_keyboard(blocked_uid), parse_mode=ParseMode.HTML)
         return
 
     if data.startswith('cancel_block_'):
         context.user_data['blocking_user_id'] = None
         context.user_data['state'] = None
-        
-        await query.message.edit_text(
-            "✅ Блокировка отменена",
-            parse_mode=ParseMode.HTML
-        )
+        await query.message.edit_text("✅ Блокировка отменена", parse_mode=ParseMode.HTML)
         return
 
     if data.startswith('unblock_'):
         if not is_staff(user_id):
             await query.answer("❌ Недостаточно прав", show_alert=True)
             return
-            
         unblocked_uid = int(data.split('_')[1])
-        
         from database.db import get_user_info
         user_info = get_user_info(unblocked_uid)
-        target_username = user_info[1] if user_info else None
-        target_first_name = user_info[2] if user_info else None
-        
         remove_from_blacklist(unblocked_uid)
-        
-        log_operator_action(
-            user_id,
-            'user_unblocked',
-            target_user_id=unblocked_uid,
-            target_username=target_username,
-            target_first_name=target_first_name
-        )
-        
+        log_operator_action(user_id, 'user_unblocked', target_user_id=unblocked_uid,
+                            target_username=user_info[1] if user_info else None,
+                            target_first_name=user_info[2] if user_info else None)
         try:
             await query.answer("✅ Пользователь разблокирован", show_alert=True)
         except Exception:
             pass
-            
-        await safe_edit_reply_markup(
-            query,
-            reply_markup=get_user_action_keyboard(unblocked_uid, is_blocked=False)
-        )
+        await safe_edit_reply_markup(query, reply_markup=get_user_action_keyboard(unblocked_uid, is_blocked=False))
         return
-    
-    # ══════════════════════════════════════════
-    # ПЕРЕКЛЮЧЕНИЕ МЕЖДУ ДИАЛОГАМИ
-    # ══════════════════════════════════════════
+
     if data.startswith('switch_dialog_'):
         if not is_staff(user_id):
             await query.answer("❌ Недостаточно прав", show_alert=True)
             return
-            
         dialog_id = data.replace('switch_dialog_', '')
         dm = DialogManager(context.bot_data)
-        
         if dm.switch_dialog(user_id, dialog_id):
             dialog_info = dm.get_dialog_info(dialog_id)
-            
-            log_operator_action(
-                user_id,
-                'dialog_switch',
-                target_user_id=dialog_info['user_id'],
-                target_first_name=dialog_info['user_name'],
-                details=f"dialog_id: {dialog_id}"
-            )
-            
-            await query.answer(
-                f"✅ Переключено на диалог с {dialog_info['user_name']}",
-                show_alert=False
-            )
-            
+            log_operator_action(user_id, 'dialog_switch', target_user_id=dialog_info['user_id'],
+                                target_first_name=dialog_info['user_name'], details=f"dialog_id: {dialog_id}")
+            await query.answer(f"✅ Переключено на {dialog_info['user_name']}", show_alert=False)
             await query.message.edit_text(
-                f"✅ <b>Активный диалог изменён</b>\n\n"
-                f"Теперь вы в диалоге с {dialog_info['user_name']}\n\n"
-                f"Используйте /dialogs для просмотра всех диалогов",
-                parse_mode=ParseMode.HTML
-            )
+                f"✅ <b>Активный диалог изменён</b>\n\nТеперь вы в диалоге с {dialog_info['user_name']}\n\n/dialogs — все диалоги",
+                parse_mode=ParseMode.HTML)
         else:
             await query.answer("❌ Ошибка переключения диалога", show_alert=True)
         return
-    
-    # ══════════════════════════════════════════
-    # ЗАВЕРШЕНИЕ ВСЕХ ДИАЛОГОВ
-    # ══════════════════════════════════════════
+
     if data == 'end_all_dialogs':
         if not is_staff(user_id):
             await query.answer("❌ Недостаточно прав", show_alert=True)
             return
-            
         dm = DialogManager(context.bot_data)
         dialogs = dm.get_all_operator_dialogs(user_id)
         user_ids = [info['user_id'] for _, info in dialogs]
-        
         count = dm.end_all_operator_dialogs(user_id)
-        
-        log_operator_action(
-            user_id,
-            'dialog_end',
-            details=f"Завершено диалогов: {count}"
-        )
-        
+        log_operator_action(user_id, 'dialog_end', details=f"Завершено диалогов: {count}")
         await query.answer(f"✅ Завершено диалогов: {count}", show_alert=True)
-        await query.message.edit_text(
-            f"✅ <b>Завершено диалогов: {count}</b>\n\n"
-            f"Все активные диалоги закрыты.",
-            parse_mode=ParseMode.HTML
-        )
-        
+        await query.message.edit_text(f"✅ <b>Завершено диалогов: {count}</b>\n\nВсе активные диалоги закрыты.", parse_mode=ParseMode.HTML)
         for other_user_id in user_ids:
             try:
-                await context.bot.send_message(
-                        chat_id=other_user_id,
-                        text=(
-                            "✅ <b>Диалог завершен</b>\n\n"
-                            "Оператор завершил диалог с вами."
-                        ),
-                        parse_mode=ParseMode.HTML
-                    )
+                await context.bot.send_message(chat_id=other_user_id,
+                    text="✅ <b>Диалог завершен</b>\n\nОператор завершил диалог с вами.", parse_mode=ParseMode.HTML)
             except Exception as e:
-                logger.error(f"Ошибка уведомления пользователя {other_user_id}: {e}")
+                logger.error(f"Ошибка уведомления {other_user_id}: {e}")
         return
