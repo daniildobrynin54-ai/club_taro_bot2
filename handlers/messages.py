@@ -344,24 +344,104 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+# Пример обновления функции _handle_reply_button для кнопки профиля
+#
+# Разместите этот код в handlers/messages.py, заменив текущую обработку BTN_PROFILE
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ОБРАБОТЧИК КНОПКИ "ПРОФИЛЬ" С РАСШИРЕННЫМИ ДАННЫМИ
+# ═══════════════════════════════════════════════════════════════════════════
+
 async def _handle_reply_button(update, context, user, user_id, text):
     dm = DialogManager(context.bot_data)
     
     if text == BTN_PROFILE:
-        profile_url = get_user_profile_url(user_id)
-        twinks_count = get_twinks_count(user_id)
-        twinks_info = f"\n💎 Твинов привязано: {twinks_count}" if twinks_count > 0 else ""
-        
-        await update.message.reply_text(
-            f"👤 <b>Ваш профиль</b>\n\n"
-            f"Имя: {user.first_name}\n"
-            f"Username: @{user.username or 'не указан'}\n"
-            f"Профиль на сайте: {profile_url or 'не привязан'}"
-            f"{twinks_info}",
-            parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True)
+        # Показываем индикатор загрузки
+        loading_msg = await update.message.reply_text(
+            "🔄 Загружаю данные профиля..."
         )
+        
+        try:
+            # Получаем данные пользователя из БД
+            from database.db import get_user_info
+            user_info = get_user_info(user_id)
+            
+            if not user_info:
+                await loading_msg.edit_text(
+                    "❌ Ошибка: данные пользователя не найдены в БД"
+                )
+                return
+            
+            # Формируем dict для построения профиля
+            user_data = {
+                'user_id': user_info[0],
+                'username': user_info[1],
+                'first_name': user_info[2],
+                'last_name': user_info[3],
+                'profile_url': get_user_profile_url(user_id),
+                'profile_id': None,  # Получим из URL
+                'site_nickname': user_info[4] if len(user_info) > 4 else None,
+            }
+            
+            # Извлекаем profile_id из URL
+            profile_url = user_data['profile_url']
+            if profile_url:
+                import re
+                match = re.search(r'/users/(\d+)', profile_url)
+                if match:
+                    user_data['profile_id'] = match.group(1)
+            
+            # Проверяем наличие необходимых данных
+            if not profile_url or not user_data['profile_id']:
+                twinks_count = get_twinks_count(user_id)
+                twinks_info = f"\n💎 Твинов привязано: {twinks_count}" if twinks_count > 0 else ""
+                
+                await loading_msg.edit_text(
+                    f"👤 <b>Базовый профиль</b>\n\n"
+                    f"Имя: {user.first_name}\n"
+                    f"Username: @{user.username or 'не указан'}\n"
+                    f"Профиль на сайте: не привязан"
+                    f"{twinks_info}\n\n"
+                    f"ℹ️ Привяжите аккаунт для доступа к расширенному профилю",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+            
+            # Строим расширенный профиль
+            from utils.profile_builder import build_user_profile, format_profile_message
+            
+            profile = build_user_profile(user_data)
+            
+            if not profile:
+                await loading_msg.edit_text(
+                    "❌ Ошибка при построении профиля. Попробуйте позже."
+                )
+                return
+            
+            # Добавляем информацию о твинах
+            twinks_count = get_twinks_count(user_id)
+            twinks_suffix = f"\n\n💎 <b>Твинов привязано:</b> {twinks_count}" if twinks_count > 0 else ""
+            
+            # Форматируем и отправляем
+            message = format_profile_message(profile) + twinks_suffix
+            
+            await loading_msg.edit_text(
+                message,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=LinkPreviewOptions(is_disabled=True)
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка показа профиля: {e}", exc_info=True)
+            await loading_msg.edit_text(
+                f"❌ Ошибка при загрузке профиля: {str(e)}\n\n"
+                f"Попробуйте позже или обратитесь к администратору."
+            )
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ОСТАЛЬНЫЕ КНОПКИ (без изменений)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
     elif text == BTN_NOTIFICATIONS:
         await update.message.reply_text(
             "🔔 <b>Уведомления</b>\n\nФункция частично разработана, вам придет уведомление в лс.",
@@ -440,7 +520,6 @@ async def _handle_reply_button(update, context, user, user_id, text):
                 parse_mode=ParseMode.HTML
             )
             context.user_data['state'] = 'contacting_operator'
-
 
 async def _handle_linking(update, context, user, user_id, user_message):
     """Обработка основной привязки аккаунта"""
