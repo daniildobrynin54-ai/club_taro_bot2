@@ -2,14 +2,19 @@
 Обработчик функционала "Хотелки"
 ✅ Парсинг хотелок пользователя и общага
 ✅ Проверка цен на карты
-✅ Группировка результатов по 5 карт
+✅ Группировка результатов по 10 карт
+✅ ОБНОВЛЕНО: Формат "Имя карты Ранг ранга есть у вас Ссылка"
+✅ АСИНХРОННЫЙ: Парсинг не блокирует обработку других запросов
 """
 import logging
 import re
 import json
-from typing import List, Set, Optional, Tuple
+import asyncio
+from typing import List, Set, Optional, Tuple, Dict
 from bs4 import BeautifulSoup
 import requests
+import csv
+from io import StringIO
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -206,12 +211,23 @@ def parse_all_user_cards(profile_id: str, session: requests.Session, locked: boo
         return all_card_ids
 
 
-def parse_obshaga_wishlist_from_sheet() -> Set[str]:
+def parse_obshaga_wishlist_from_sheet() -> Dict[str, Dict[str, str]]:
     """
-    Парсит хотелки общага из Google Sheets (столбец C, лист с GID=1363566974)
+    ✅ ОБНОВЛЕНО: Парсит хотелки общага из Google Sheets с именем и рангом
+    
+    Столбцы:
+    - A: Имя карты
+    - B: Ранг карты  
+    - C: Ссылка на карту
     
     Returns:
-        Set[str]: Множество ID карт из хотелок общага
+        Dict[str, Dict[str, str]]: {
+            'card_id': {
+                'name': 'Имя карты',
+                'rank': 'C'
+            },
+            ...
+        }
     """
     WISHLIST_SHEET_GID = "1363566974"
     SPREADSHEET_ID = "1sYvrBU9BPhcoxTnNJfx8TOutxwFrSiRm2mw_8s6rdZM"
@@ -225,39 +241,47 @@ def parse_obshaga_wishlist_from_sheet() -> Set[str]:
         
         if response.status_code != 200:
             logger.error(f"Ошибка загрузки таблицы: {response.status_code}")
-            return set()
+            return {}
         
-        card_ids = set()
+        card_data = {}
         
         # Парсим CSV
-        import csv
-        from io import StringIO
-        
         csv_data = StringIO(response.text)
         reader = csv.reader(csv_data)
         
         # Пропускаем заголовок
         next(reader, None)
         
-        # Столбец C = индекс 2
+        # Столбцы: A=0 (имя), B=1 (ранг), C=2 (ссылка)
         for row in reader:
-            if len(row) > 2:  # Проверяем что есть столбец C
-                cell_value = row[2].strip()
-                
-                # Извлекаем ID карты из ссылки или берем как есть
-                # Формат может быть: "https://mangabuff.ru/cards/123456/users" или просто "123456"
-                match = re.search(r'/cards/(\d+)/', cell_value)
-                if match:
-                    card_ids.add(match.group(1))
-                elif cell_value.isdigit():
-                    card_ids.add(cell_value)
+            if len(row) < 3:  # Проверяем что есть все нужные столбцы
+                continue
+            
+            card_name = row[0].strip()
+            card_rank = row[1].strip()
+            card_url = row[2].strip()
+            
+            # Извлекаем ID карты из ссылки
+            match = re.search(r'/cards/(\d+)/', card_url)
+            if match:
+                card_id = match.group(1)
+                card_data[card_id] = {
+                    'name': card_name,
+                    'rank': card_rank
+                }
+            elif card_url.isdigit():
+                # Если в столбце C просто ID
+                card_data[card_url] = {
+                    'name': card_name,
+                    'rank': card_rank
+                }
         
-        logger.info(f"✅ Найдено {len(card_ids)} карт в хотелках общага")
-        return card_ids
+        logger.info(f"✅ Найдено {len(card_data)} карт в хотелках общага с именами и рангами")
+        return card_data
         
     except Exception as e:
         logger.error(f"Ошибка парсинга таблицы: {e}", exc_info=True)
-        return set()
+        return {}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -272,7 +296,7 @@ async def handle_my_wishlist_in_obshaga(update: Update, context: ContextTypes.DE
     2. Парсит карты общага
     3. Находит пересечения
     4. Проверяет цены
-    5. Отправляет результат группами по 5
+    5. Отправляет результат группами по 10
     """
     query = update.callback_query
     user_id = query.from_user.id
@@ -307,7 +331,6 @@ async def handle_my_wishlist_in_obshaga(update: Update, context: ContextTypes.DE
         await loading_msg.edit_text(
             f"✅ Найдено {len(user_wishlist)} ваших хотелок\n\n"
             f"🔍 Проверяю карты общага...",
-            f"Это может занять несколько минут, пожалуйста подождите.",
             parse_mode=ParseMode.HTML
         )
         
@@ -377,9 +400,9 @@ async def handle_my_wishlist_in_obshaga(update: Update, context: ContextTypes.DE
             parse_mode=ParseMode.HTML
         )
         
-        # Отправляем группами по 5
-        for i in range(0, len(results), 5):
-            batch = results[i:i+5]
+        # Отправляем группами по 10
+        for i in range(0, len(results), 10):
+            batch = results[i:i+10]
             
             text = "\n\n".join([
                 f"🎴 <a href='{r['url']}'>Карта {r['card_id']}</a>\n"
@@ -407,12 +430,16 @@ async def handle_my_wishlist_in_obshaga(update: Update, context: ContextTypes.DE
 
 async def handle_obshaga_wishlist_with_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
+    ✅ ОБНОВЛЕНО: Формат "Имя карты Ранг ранга есть у вас Ссылка"
+    
     Обработчик: "Хотелки общага у меня"
     
     1. Парсит незакрытые карты пользователя (?lock=0)
-    2. Загружает хотелки общага из Google Sheets
+    2. Загружает хотелки общага из Google Sheets (с именем и рангом)
     3. Находит пересечения
-    4. Отправляет результат группами по 5
+    4. Отправляет результат группами по 10
+    
+    ✅ Асинхронный - не блокирует обработку других запросов
     """
     query = update.callback_query
     user_id = query.from_user.id
@@ -433,8 +460,10 @@ async def handle_obshaga_wishlist_with_me(update: Update, context: ContextTypes.
     )
     
     try:
-        # 1. Парсим незакрытые карты пользователя
-        user_cards = parse_all_user_cards(selected_profile_id, site_session, locked=False)
+        # 1. Парсим незакрытые карты пользователя (в отдельном потоке)
+        user_cards = await asyncio.to_thread(
+            parse_all_user_cards, selected_profile_id, site_session, False
+        )
         
         if not user_cards:
             await loading_msg.edit_text(
@@ -449,8 +478,8 @@ async def handle_obshaga_wishlist_with_me(update: Update, context: ContextTypes.
             parse_mode=ParseMode.HTML
         )
         
-        # 2. Парсим хотелки общага из таблицы
-        obshaga_wishlist = parse_obshaga_wishlist_from_sheet()
+        # 2. Парсим хотелки общага из таблицы (в отдельном потоке)
+        obshaga_wishlist = await asyncio.to_thread(parse_obshaga_wishlist_from_sheet)
         
         if not obshaga_wishlist:
             await loading_msg.edit_text(
@@ -467,7 +496,8 @@ async def handle_obshaga_wishlist_with_me(update: Update, context: ContextTypes.
         )
         
         # 3. Находим пересечения
-        matches = user_cards & obshaga_wishlist
+        obshaga_card_ids = set(obshaga_wishlist.keys())
+        matches = user_cards & obshaga_card_ids
         
         if not matches:
             await loading_msg.edit_text(
@@ -481,14 +511,16 @@ async def handle_obshaga_wishlist_with_me(update: Update, context: ContextTypes.
         
         logger.info(f"✅ Найдено {len(matches)} совпадений")
         
-        # 4. Формируем результат
-        results = [
-            {
+        # 4. Формируем результат с именем и рангом
+        results = []
+        for card_id in sorted(matches):
+            card_info = obshaga_wishlist[card_id]
+            results.append({
                 'card_id': card_id,
+                'name': card_info['name'],
+                'rank': card_info['rank'],
                 'url': f"{BASE_URL}/cards/{card_id}/users"
-            }
-            for card_id in sorted(matches)
-        ]
+            })
         
         # 5. Отправляем результат
         await loading_msg.delete()
@@ -503,12 +535,13 @@ async def handle_obshaga_wishlist_with_me(update: Update, context: ContextTypes.
             parse_mode=ParseMode.HTML
         )
         
-        # Отправляем группами по 5
-        for i in range(0, len(results), 5):
-            batch = results[i:i+5]
+        # ✅ НОВЫЙ ФОРМАТ: "Имя карты Ранг ранга есть у вас Ссылка"
+        for i in range(0, len(results), 10):
+            batch = results[i:i+10]
             
             text = "\n\n".join([
-                f"🎴 <a href='{r['url']}'>Карта {r['card_id']}</a>"
+                f"🎴 <b>{r['name']}</b> {r['rank']} ранга есть у вас\n"
+                f"<a href='{r['url']}'>Ссылка на карту</a>"
                 for r in batch
             ])
             
