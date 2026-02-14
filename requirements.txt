@@ -1,4 +1,35 @@
-python-telegram-bot[job-queue]>=21.9
-requests==2.31.0
-beautifulsoup4==4.12.3
+# Core dependencies
+python-telegram-bot[job-queue]==22.6
+requests==2.32.5
+beautifulsoup4==4.14.3
+openpyxl==3.1.5
+
+# Image processing for rank detection (используется в utils/rank_detector.py)
+numpy>=1.26.0
+Pillow>=10.0.0
+
+# HTML parsing (optional but recommended for better performance)
 lxml>=5.3.0
+
+# Dependencies pulled automatically by python-telegram-bot[job-queue]
+apscheduler==3.11.2
+httpx==0.28.1
+httpcore==1.0.9
+h11==0.16.0
+anyio==4.12.1
+certifi==2026.1.4
+idna==3.11
+
+# Dependencies for requests
+urllib3==2.6.3
+charset-normalizer==3.4.4
+
+# Dependencies for beautifulsoup4
+soupsieve==2.8.3
+
+# Dependencies for openpyxl
+et-xmlfile==2.0.0
+
+# Timezone support
+tzlocal==5.3.1
+tzdata==2025.3
