@@ -12,6 +12,7 @@ Club Taro Telegram Bot
 ✅ Команды: /logs, /stats, /history
 ✅ ИСПРАВЛЕНО: Команды управления ролями (/setrole, /promote, /demote, /staff, /myrole)
 ✅ ДОБАВЛЕНО: Функционал цен на карты (загрузка Excel, запрос цен)
+✅ ИСПРАВЛЕНО: Обработка сообщений только в приватных чатах (не в группах)
 """
 import logging
 from telegram import Update
@@ -20,7 +21,7 @@ from telegram.ext import (
     MessageHandler, filters
 )
 from telegram.error import TelegramError, NetworkError, TimedOut
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatType
 from config.settings import BOT_TOKEN
 from database.db import init_db, is_user_linked
 from handlers.commands import (
@@ -51,7 +52,13 @@ logger = logging.getLogger(__name__)
 # ═════════════════════════════════════════════════════════════
 
 async def error_handler(update: object, context) -> None:
-    """Глобальный обработчик ошибок"""
+    """
+    ✅ ИСПРАВЛЕНО: Глобальный обработчик ошибок
+    
+    Изменения:
+    - Не отправляет сообщения об ошибках в групповые чаты
+    - Отправляет только в приватные чаты
+    """
     logger.error("=" * 60)
     logger.error("⚠️  ПРОИЗОШЛА ОШИБКА В БОТЕ")
     logger.error("=" * 60)
@@ -63,6 +70,8 @@ async def error_handler(update: object, context) -> None:
         if isinstance(update, Update):
             if update.effective_user:
                 logger.error(f"Пользователь: {update.effective_user.id} (@{update.effective_user.username})")
+            if update.effective_chat:
+                logger.error(f"Чат: {update.effective_chat.id} (тип: {update.effective_chat.type})")
             if update.callback_query:
                 logger.error(f"Callback data: {update.callback_query.data}")
             if update.message:
@@ -81,13 +90,22 @@ async def error_handler(update: object, context) -> None:
     
     logger.error("=" * 60)
     
+    # ✅ ИСПРАВЛЕНИЕ: Отправляем сообщение об ошибке только в приватные чаты
     try:
         if update and isinstance(update, Update):
-            if update.effective_message:
-                await update.effective_message.reply_text(
-                    "⚠️ Произошла техническая ошибка. Попробуйте позже или обратитесь к администратору.",
-                    disable_notification=True
-                )
+            if update.effective_message and update.effective_chat:
+                # Проверяем, что это приватный чат
+                if update.effective_chat.type == ChatType.PRIVATE:
+                    await update.effective_message.reply_text(
+                        "⚠️ Произошла техническая ошибка. Попробуйте позже или обратитесь к администратору.",
+                        disable_notification=True
+                    )
+                    logger.info(f"Отправлено сообщение об ошибке пользователю {update.effective_user.id}")
+                else:
+                    logger.info(
+                        f"Ошибка в групповом чате {update.effective_chat.id}, "
+                        f"сообщение об ошибке НЕ отправлено"
+                    )
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение об ошибке пользователю: {e}")
 
@@ -127,6 +145,7 @@ def main():
     print("✅ Команды логов: /logs, /stats, /history")
     print("✅ ИСПРАВЛЕНО: Команды ролей: /setrole, /promote, /demote, /staff, /myrole")
     print("✅ ДОБАВЛЕНО: Функционал цен на карты")
+    print("✅ ИСПРАВЛЕНО: Обработка только приватных чатов")
     print("=" * 60)
     
     # Инициализируем БД
@@ -147,7 +166,7 @@ def main():
         
         if helpers.login_to_site():
             print("✅ Успешная авторизация на сайте")
-            web_session = helpers.site_session  # ← Берём через модуль!
+            web_session = helpers.site_session
         else:
             print("❌ Ошибка авторизации на сайте")
             print("⚠️  Бот будет работать, но функции проверки членства могут быть недоступны")
@@ -234,11 +253,21 @@ def main():
     # Обработчики сообщений и callback
     application.add_handler(CallbackQueryHandler(button_handler))
     
-    # ✅ ОБРАБОТЧИК ДОКУМЕНТОВ (для загрузки Excel файлов с ценами)
-    application.add_handler(MessageHandler(filters.Document.ALL, message_handler))
+    # ✅ ИСПРАВЛЕНИЕ: Обработчик документов только в приватных чатах
+    application.add_handler(
+        MessageHandler(
+            filters.Document.ALL & filters.ChatType.PRIVATE,
+            message_handler
+        )
+    )
     
-    # Обработчик текстовых сообщений (должен быть последним)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    # ✅ ИСПРАВЛЕНИЕ: Обработчик текстовых сообщений только в приватных чатах (должен быть последним)
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            message_handler
+        )
+    )
     
     # Запускаем бота
     print("=" * 60)
@@ -266,8 +295,9 @@ def main():
     print("   • Пользователи: кнопка '💳 Узнать цену Карты'")
     print("   • Операторы: кнопка '💳 Загрузить цены' (Excel)")
     print("   • Автоотправка запросов на оценку в топик")
+    print("🔒 ИСПРАВЛЕНО: Обработка сообщений только в приватных чатах")
     print("=" * 60)
-    logger.info("Бот запущен со всеми системами, включая логирование, управление ролями и функционал цен")
+    logger.info("Бот запущен со всеми системами, включая логирование, управление ролями, функционал цен и фильтрацию групповых чатов")
     
     try:
         application.run_polling(
